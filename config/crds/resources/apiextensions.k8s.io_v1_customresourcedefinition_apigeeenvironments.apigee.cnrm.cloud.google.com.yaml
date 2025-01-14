@@ -94,7 +94,9 @@ spec:
               displayName:
                 description: Optional. Display name for this environment.
                 type: string
-              properties:
+              properties: # todo acpana is this allowed, yes it seems so
+                # todo acpana the isssue is that type objects are not
+# well recorded in the path because they don't finish into a terminal primtive node
                 additionalProperties:
                   type: string
                 description: Optional. Key-value pairs that may be used for customizing

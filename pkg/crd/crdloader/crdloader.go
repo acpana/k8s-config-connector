@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"path"
+	"sort"
 	"strings"
 
 	"github.com/GoogleCloudPlatform/k8s-config-connector/operator/pkg/test/util/paths"
@@ -179,6 +180,9 @@ func LoadAllCRDs() ([]apiextensions.CustomResourceDefinition, error) {
 		}
 		results = append(results, crds...)
 	}
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].Name < results[j].Name
+	})
 	return results, nil
 }
 

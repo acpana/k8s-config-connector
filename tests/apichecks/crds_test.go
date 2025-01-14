@@ -51,6 +51,8 @@ func TestFieldsSet(t *testing.T) {
 			if version.Name == "v1alpha1" {
 				continue
 			}
+			kind := crd.Spec.Names.Kind
+			fmt.Println(kind)
 			gvk := schema.GroupVersionKind{
 				Group: crd.Spec.Group, Version: version.Name, Kind: crd.Spec.Names.Kind,
 			}
@@ -67,8 +69,15 @@ func TestFieldsSet(t *testing.T) {
 				}
 
 				switch field.props.Type {
+				case "object":
+					if len(field.props.Properties) == 0 {
+						// this is a "leaf"
+						// todo acpana -- this may only be true for addiionalProperties: string!
+						fieldSet[fieldPath] = false
+					}
+
 				case "string", "boolean", "integer", "number":
-					// only mark "leaf" paths
+					// mark "leaf" paths
 					fieldSet[fieldPath] = false // initialize as not found
 				}
 			})
@@ -109,8 +118,22 @@ func TestFieldsSet(t *testing.T) {
 			fieldsForGVK := betaGVKsToFieldSet[gvk]
 			for field := range setFields {
 				if _, ok := fieldsForGVK[field]; !ok {
-					//t.Logf("field %s not found for gvk %s's fields %+v", field, gvk, fieldsForGVK)
-					t.Logf("field %s not found in schema for gvk %s", field, gvk)
+					// todo acpana handle complex dynamic types like ".spec.properties.key "
+					// where ".key" is dynamically created (i.e. not defined in the CRD)
+					if gvk.Kind == "AlloyDBBackup" {
+						if field == "kmsKeyNameRef" {
+							field = "kmsKeyName"
+						}
+						// todo acpana handle other fields that get  mapped
+
+					}
+					if gvk.Kind != "AccessContextManagerServicePerimeter" &&
+					 gvk.Kind != "AlloyDBBackup"  && gvk.Kind != "ApigeeEnvironment" && 
+					 gvk.Kind != "ApigeeOrganization" && gvk.Kind != "IAMWorkloadIdentityPoolProvider" && gvk.Kind != "RunJob"{
+						// todo acpana pretty sure ApigeeOrganization's sample is wrong, there is no instanceConfig for the v1beta1
+						t.Fatalf("field %s not found for gvk %s's fields %+v", field, gvk, fieldsForGVK)
+					}
+					//t.Logf("field %s not found in schema for gvk %s", field, gvk)
 				} else {
 					fieldsForGVK[field] = true
 				}
@@ -148,8 +171,8 @@ func TestFieldsSet(t *testing.T) {
 		fieldsForGVK := betaGVKsToFieldSet[gvk]
 		for field := range setFields {
 			if _, ok := fieldsForGVK[field]; !ok {
-				//t.Logf("field %s not found for gvk %s's fields %+v", field, gvk, fieldsForGVK)
-				t.Logf("field %s not found in schema for gvk %s", field, gvk)
+				t.Fatalf("field %s not found for gvk %s's fields %+v", field, gvk, fieldsForGVK)
+				//t.Logf("field %s not found in schema for gvk %s", field, gvk)
 			} else {
 				fieldsForGVK[field] = true
 			}
@@ -403,21 +426,21 @@ func visitProps(props *apiextensions.JSONSchemaProps, fieldPath string, callback
 }
 
 func visitUnstructFields(fields interface{}, fieldPath string, callback func(field string)) {
-	switch actual := fields.(type) {
+	switch actualField := fields.(type) {
 	case nil:
 		// nothing to do
 	case []interface{}:
-		for _, k := range actual {
+		for _, k := range actualField {
 			switch k.(type) {
 			case string, bool, int, int32, int64, float64:
 				// this is a terminal stage
-				callback(fieldPath)
+				callback(fieldPath+"[]")
 				continue
 			}
 			visitUnstructFields(k, fieldPath+"[]", callback)
 		}
 	case map[string]interface{}:
-		for k, v := range actual {
+		for k, v := range actualField {
 			switch v.(type) {
 			case string, bool, int, int32, int64, float64:
 				// this is a terminal stage

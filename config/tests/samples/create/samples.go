@@ -44,6 +44,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	//"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
 type Sample struct {
@@ -312,6 +313,9 @@ func LoadMatchingSamples(t *testing.T, regex *regexp.Regexp, project testgcp.GCP
 		sample := loadSampleOntoUnstructs(t, sampleKey, project)
 		samples = append(samples, sample)
 	}
+	sort.Slice(samples, func(i, j int) bool {
+		return samples[i].Name < samples[j].Name
+	})
 	return samples
 }
 
@@ -349,6 +353,33 @@ func loadSampleOntoUnstructs(t *testing.T, sampleKey SampleKey, project testgcp.
 	}
 	return s
 }
+
+// func loadSampleOntoUnstructsNoSub(t *testing.T, sampleKey SampleKey,) Sample {
+// 	t.Helper()
+
+// 	// sub!
+// 	// subVars := newSubstitutionVariables(t, project)
+// 	resources := make([]*unstructured.Unstructured, 0)
+// 	for _, f := range sampleKey.files {
+// 		unstructs := readFileToUnstructs(t, f, make(map[string]string))
+// 		resources = append(resources, unstructs...)
+// 	}
+// 	s := Sample{
+// 		Name:      sampleKey.Name,
+// 		Resources: resources,
+// 	}
+// 	return s
+// }
+
+// // todo doc
+// func LoadSamplesForGVK(t *testing.T, gvk schema.GroupVersionKind) {
+// 	keys := ListMatchingSamples(t, regexp.MustCompile(".*"))
+
+// 	for _, k := range keys {
+// 		sample := loadSampleOntoUnstructsNoSub(t, k)
+
+// 	}
+// }
 
 // ListMatchingSamples gets the keys for all samples matching the regex, without loading them.
 func ListMatchingSamples(t *testing.T, regex *regexp.Regexp) []SampleKey {
