@@ -62,8 +62,13 @@ func ApplySQLInstanceGCPDefaults(in *krm.SQLInstance, out *api.DatabaseInstance,
 		out.Settings.DataDiskType = "PD_SSD"
 	}
 	if in.Spec.Settings.Edition == nil {
-		// GCP default Edition is ENTERPRISE.
-		out.Settings.Edition = "ENTERPRISE"
+		if actual != nil {
+			// If desired edition is not specified, assume user wants the actual.
+			out.Settings.Edition = actual.Settings.Edition
+		} else {
+			// GCP default Edition is ENTERPRISE.
+			out.Settings.Edition = "ENTERPRISE"
+		}
 	}
 	if in.Spec.Settings.IpConfiguration == nil {
 		// GCP default IpConfiguration.
