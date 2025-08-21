@@ -292,20 +292,33 @@ func (a *sqlInstanceAdapter) Update(ctx context.Context, updateOp *directbase.Up
 	}
 
 	// Next, handle database edition updates
-	if a.desired.Spec.Settings.Edition != nil && *a.desired.Spec.Settings.Edition != a.actual.Settings.Edition {
+	var desiredEdition string
+	if a.desired.Spec.Settings.Edition != nil {
+		desiredEdition = *a.desired.Spec.Settings.Edition
+	} else {
+		desiredEdition = "ENTERPRISE" // This is the GCP default.
+	}
+	if desiredEdition != a.actual.Settings.Edition {
+		// When changing the edition, we must also provide the tier.
+		// If the user has specified a tier in the spec, we use that.
+		// Otherwise, we use the tier from the actual resource.
+		// Note that this might fail if the actual tier is incompatible with the new edition.
+		// In that case, the user must specify a compatible tier in the spec.
+		tierForPatch := a.desired.Spec.Settings.Tier
+		if tierForPatch == "" {
+			tierForPatch = a.actual.Settings.Tier
+		}
+
 		newEditionDb := &api.DatabaseInstance{
 			Settings: &api.Settings{
-				Edition: direct.ValueOf(a.desired.Spec.Settings.Edition),
-				// ENTERPRISE_PLUS edition has limitations on the allowable set of tiers that can be used. Therefore, when
-				// modifying the edition, we should also allow modifications to the tier at the same time, so that the
-				// user can update from an invalid tier to a valid tier (when going from ENTERPRISE -> ENTERPRISE_PLUS).
-				Tier: a.desired.Spec.Settings.Tier,
+				Edition: desiredEdition,
+				Tier:    tierForPatch,
 			},
 		}
 
 		{
 			report := &structuredreporting.Diff{}
-			report.AddField(".settings.edition", a.actual.Settings.Edition, a.desired.Spec.Settings)
+			report.AddField(".settings.edition", a.actual.Settings.Edition, desiredEdition)
 			structuredreporting.ReportDiff(ctx, report)
 		}
 
