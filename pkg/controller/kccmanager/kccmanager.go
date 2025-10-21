@@ -36,20 +36,22 @@ import (
 	"github.com/GoogleCloudPlatform/k8s-config-connector/pkg/gcp"
 	"github.com/GoogleCloudPlatform/k8s-config-connector/pkg/gcpwatch"
 	"github.com/GoogleCloudPlatform/k8s-config-connector/pkg/k8s"
+	"github.com/GoogleCloudPlatform/k8s-config-connector/pkg/krmtotf"
 	"github.com/GoogleCloudPlatform/k8s-config-connector/pkg/servicemapping/servicemappingloader"
 	"github.com/GoogleCloudPlatform/k8s-config-connector/pkg/stateintospec"
 	tfprovider "github.com/GoogleCloudPlatform/k8s-config-connector/pkg/tf/provider"
+	mcleclient "github.com/gke-labs/multicluster-leader-election/pkg/client"
 	"golang.org/x/oauth2"
 	"google.golang.org/grpc"
-
 	corev1 "k8s.io/api/core/v1"
 	apiextensions "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/rest"
+	"k8s.io/klog/v2"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
+	crclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
-
-	// Register direct controllers
-	_ "github.com/GoogleCloudPlatform/k8s-config-connector/pkg/controller/direct"
 )
 
 type Config struct {
@@ -219,6 +221,59 @@ func New(ctx context.Context, restConfig *rest.Config, cfg Config) (manager.Mana
 		return nil, fmt.Errorf("error adding registration controller: %w", err)
 	}
 	return mgr, nil
+}
+
+func NewManager(ctx context.Context, restCfg *rest.Config, c crclient.Client, scopedNamespace string, userProjectOverride bool, billingProject string) (manager.Manager, manager.Options, error) {
+	krmtotf.SetUserAgentForTerraformProvider()
+	opts := manager.Options{}
+	if scopedNamespace != "" {
+		opts.Cache.DefaultNamespaces = map[string]cache.Config{
+			scopedNamespace: {},
+		}
+	}
+
+	// Get the ConfigConnector object.
+	cc := &operatorv1beta1.ConfigConnector{}
+	ccName := types.NamespacedName{Name: "configconnector.core.cnrm.cloud.google.com"}
+	klog.Infof("checking for ConfigConnector object")
+	if err := c.Get(ctx, ccName, cc); err != nil {
+		// If the ConfigConnector object is not found, proceed with default leader election.
+		klog.Infof("ConfigConnector object not found, using default in-cluster leader election")
+	} else {
+		klog.Infof("found ConfigConnector object")
+		if cc.Spec.Experiments == nil {
+			// todo acpana short circuit
+		} else if cc.Spec.Experiments.LeaderElection != nil && cc.Spec.Experiments.LeaderElection.MultiClusterLease != nil {
+			klog.Infof("multi-cluster leader election is configured")
+			leaseSpec := cc.Spec.Experiments.LeaderElection.MultiClusterLease
+			lock := mcleclient.New(
+				c,
+				leaseSpec.LeaseName,
+				leaseSpec.Namespace,
+				leaseSpec.GlobalLockName,
+				15*time.Second,
+			)
+			opts.LeaderElectionResourceLock = leaseSpec.GlobalLockName
+			opts.LeaderElection = true
+			opts.LeaderElectionNamespace = leaseSpec.Namespace
+			opts.LeaderElectionID = leaseSpec.LeaseName
+			opts.LeaderElectionResourceLockInterface = lock
+		}
+	}
+
+	controllersCfg := Config{
+		ManagerOptions: opts,
+	}
+
+	controllersCfg.UserProjectOverride = userProjectOverride
+	controllersCfg.BillingProject = billingProject
+	// TODO(b/320784855): StateIntoSpecDefaultValue and StateIntoSpecUserOverride values should come from the flags.
+	controllersCfg.StateIntoSpecDefaultValue = stateintospec.StateIntoSpecDefaultValueV1Beta1
+	mgr, err := New(ctx, restCfg, controllersCfg)
+	if err != nil {
+		return nil, opts, fmt.Errorf("error creating manager: %w", err)
+	}
+	return mgr, opts, nil
 }
 
 func addSchemes(scheme *runtime.Scheme) error {

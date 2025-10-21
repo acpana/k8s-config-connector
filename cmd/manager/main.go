@@ -62,6 +62,7 @@ func main() {
 		pprofPort                int
 		rateLimitQps             float32
 		rateLimitBurst           int
+		multiClusterElection     bool
 	)
 	flag.StringVar(&prometheusScrapeEndpoint, "prometheus-scrape-endpoint", ":8888", "configure the Prometheus scrape endpoint; :8888 as default")
 	flag.BoolVar(&controllermetrics.ResourceNameLabel, "resource-name-label", false, "option to enable the resource name label on some Prometheus metrics; false by default")
@@ -72,6 +73,7 @@ func main() {
 	flag.IntVar(&pprofPort, "pprof-port", 6060, "The port that the pprof server binds to if enabled.")
 	flag.Float32Var(&rateLimitQps, "qps", 20.0, "The client-side token bucket rate limit qps.")
 	flag.IntVar(&rateLimitBurst, "burst", 30, "The client-side token bucket rate limit burst.")
+	flag.BoolVar(&multiClusterElection, "multi-cluster-election", false, "Enable multi-cluster leader election.")
 	profiler.AddFlag(flag.CommandLine)
 	flag.CommandLine.AddGoFlagSet(goflag.CommandLine)
 	flag.Parse()
