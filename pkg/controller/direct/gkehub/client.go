@@ -36,6 +36,7 @@ func newGCPClient(config *config.ControllerConfig) (*gcpClient, error) {
 type gkeHubClient struct {
 	featureClient   *featureapi.ProjectsLocationsFeaturesService
 	scopeClient     *featureapi.ProjectsLocationsScopesService
+	namespaceClient *featureapi.ProjectsLocationsScopesNamespacesService
 	operationClient *featureapi.ProjectsLocationsOperationsService
 }
 
@@ -46,11 +47,13 @@ func (m *gcpClient) newGkeHubClient(ctx context.Context) (*gkeHubClient, error) 
 	}
 	service, err := featureapi.NewService(ctx, opts...)
 	if err != nil {
-		return nil, fmt.Errorf("building service for gkehub: %w", err)
+		return nil, fmt.Errorf("building service for gkehub v1beta: %w", err)
 	}
+
 	return &gkeHubClient{
 		featureClient:   featureapi.NewProjectsLocationsFeaturesService(service),
 		scopeClient:     featureapi.NewProjectsLocationsScopesService(service),
+		namespaceClient: featureapi.NewProjectsLocationsScopesNamespacesService(service),
 		operationClient: featureapi.NewProjectsLocationsOperationsService(service),
 	}, nil
 }
