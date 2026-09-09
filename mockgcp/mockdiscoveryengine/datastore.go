@@ -143,7 +143,6 @@ func (n *dataStoreName) String() string {
 func (s *MockService) parseDataStoreName(name string) (*dataStoreName, error) {
 	tokens := strings.Split(name, "/")
 	if len(tokens) == 8 && tokens[0] == "projects" && tokens[2] == "locations" && tokens[4] == "collections" && tokens[6] == "dataStores" {
-
 		project, err := s.Projects.GetProjectByID(tokens[1])
 		if err != nil {
 			return nil, err
@@ -154,6 +153,19 @@ func (s *MockService) parseDataStoreName(name string) (*dataStoreName, error) {
 			Location:   tokens[3],
 			Collection: tokens[5],
 			DataStore:  tokens[7],
+		}, nil
+	}
+	if len(tokens) == 6 && tokens[0] == "projects" && tokens[2] == "locations" && tokens[4] == "dataStores" {
+		project, err := s.Projects.GetProjectByID(tokens[1])
+		if err != nil {
+			return nil, err
+		}
+
+		return &dataStoreName{
+			Project:    project,
+			Location:   tokens[3],
+			Collection: "default_collection",
+			DataStore:  tokens[5],
 		}, nil
 	}
 
