@@ -26,6 +26,7 @@ import (
 	"github.com/GoogleCloudPlatform/k8s-config-connector/pkg/cli/kubecli"
 	syncerv1alpha1 "github.com/gke-labs/kube-etl/syncer/api/v1alpha1"
 	mclv1alpha1 "github.com/gke-labs/multicluster-leader-election/api/v1alpha1"
+	mclstorage "github.com/gke-labs/multicluster-leader-election/pkg/storage"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -41,26 +42,33 @@ import (
 const (
 	fleetLeaseName      = "kcc-multicluster-lease"
 	fleetLeaseNamespace = "cnrm-system"
+	fleetLeaseKey       = fleetLeaseNamespace + "/" + fleetLeaseName
+	fleetLeaseBucket    = "test-lease-bucket"
 
 	managerComponentLabel = "cnrm.cloud.google.com/component"
 	managerComponent      = "cnrm-controller-manager"
 	scopedNamespaceLabel  = "cnrm.cloud.google.com/scoped-namespace"
 )
 
-// haFleet stands in for what runs on the clusters of an HA group while failover works on them:
-//   - the StatefulSet controller and the kubelet, which stop and start the managers' pods;
-//   - the MCL controllers, which give an expired lease to a cluster whose managers run, and
-//     report the holder in every cluster's MultiClusterLease;
-//   - Config Connector's managers, which renew the lease while they run, and keep their
-//     KRMSyncers pointed at the leader.
+// haFleet stands in for what runs on the clusters of an HA group while HA commands work on them:
+//   - the StatefulSet and Deployment controllers and the kubelet, which stop and start pods;
+//   - the shared lease store (storage.NewFakeStorage) and the MCL controllers, which renew or
+//     acquire the lease and report its state in every cluster's MultiClusterLease;
+//   - Config Connector's managers, which read ConfigConnector on startup (running standalone when
+//     spec.experiments.multiClusterLease is absent, or with leader election otherwise), exit and
+//     restart on leadership loss, and keep their KRMSyncers pointed at the leader.
 //
-// The fleet moves one step each time failover calls the API of one of its clusters, so the tests
-// need no sleeps. It is a model of those components, written from their code.
+// The fleet moves one step each time a command calls the API of one of its clusters, so the tests
+// need no sleeps. It asserts on every step that managers of two clusters never reconcile at once.
 type haFleet struct {
 	t        *testing.T
 	clusters []*fleetCluster
 
-	// holder is the cluster that holds the lease.
+	// leaseStore is the shared fake GCS lease store used by the MCL controllers and ha deactivate.
+	leaseStore  mclstorage.Storage
+	leaseBucket string
+
+	// holder is the cluster that holds the lease (nil if closed or held by an external cluster).
 	holder *fleetCluster
 	// holders are the clusters that have held the lease, in order.
 	holders []string
@@ -72,13 +80,17 @@ type haFleet struct {
 	// takeOverSteps is how many steps the lease takes to expire once the holder's managers have
 	// stopped. The first cluster that asks for it then takes it.
 	takeOverSteps int
-	// podStopSteps is how many steps a manager's pod takes to stop.
+	// podStopSteps is how many steps a manager's or MCL controller's pod takes to stop.
 	podStopSteps int
+	// leaseLossSteps is how many steps a leading manager takes to exit and restart after losing
+	// the lease.
+	leaseLossSteps int
 
-	steps int
+	nextUID int
+	steps   int
 	// onStep, if set, runs at the start of every step.
 	onStep func()
-	// patches are failover's writes, in order.
+	// patches are non-dry-run patches, in order.
 	patches []fleetPatch
 }
 
@@ -140,20 +152,41 @@ type fleetCluster struct {
 	// rejectRead, if set, can fail a read of failover from the cluster. It gets the object or the
 	// list that failover asks for.
 	rejectRead func(ctx context.Context, obj runtime.Object) error
-	// rejectPatch, if set, can fail a write of failover to the cluster. It gets the object and
+	// rejectPatch, if set, can fail a write of a command to the cluster. It gets the object and
 	// the patch.
 	rejectPatch func(obj client.Object, patch string) error
+	// rejectUpdate, if set, can fail an Update of a command to the cluster.
+	rejectUpdate func(obj client.Object) error
+	// rejectDelete, if set, can fail a Delete of a command to the cluster.
+	rejectDelete func(obj client.Object) error
+	// stuckLeader keeps a leading manager from exiting on its own after losing the lease, so tests
+	// can exercise Step 4's stale-pod deletion.
+	stuckLeader bool
 
 	// stopping counts, for each manager scaled to 0, the steps since its pod was told to stop.
 	stopping map[types.NamespacedName]int
+	// mclStopping counts steps since the MCL Deployment was scaled to 0.
+	mclStopping int
+	// podModes tracks the runtime mode (standalone vs leader-election, leading, reconciling,
+	// restart count) of each manager pod currently running on this cluster.
+	podModes map[types.NamespacedName]*fleetPodState
+}
+
+type fleetPodState struct {
+	uid            types.UID
+	standalone     bool
+	leading        bool
+	reconciling    bool
+	restartCount   int32
+	lostLeaseSteps int
 }
 
 func (c *fleetCluster) identity() string {
 	return c.gke.ResourceName()
 }
 
-// newHAFleet returns a fleet of clusters in cluster mode. Each has one manager, and the first
-// one is the leader. The clusters' objects are in fake clients.
+// newHAFleet returns a fleet of clusters in cluster mode. Each has one manager and an MCL
+// controller Deployment, and the first one is the leader. The clusters' objects are in fake clients.
 func newHAFleet(t *testing.T, names ...string) *haFleet {
 	t.Helper()
 	scheme, err := newHAScheme()
@@ -164,19 +197,27 @@ func newHAFleet(t *testing.T, names ...string) *haFleet {
 	for _, name := range names {
 		backend := fake.NewClientBuilder().
 			WithScheme(scheme).
-			WithStatusSubresource(&appsv1.StatefulSet{}, &corev1.Pod{}, &mclv1alpha1.MultiClusterLease{}, &syncerv1alpha1.KRMSyncer{}).
+			WithStatusSubresource(&appsv1.StatefulSet{}, &appsv1.Deployment{}, &corev1.Pod{}, &mclv1alpha1.MultiClusterLease{}, &syncerv1alpha1.KRMSyncer{}).
 			Build()
 		c := fleet.addCluster(name, backend)
 		c.create(newConfigConnectorWithMCL(fleetLeaseName, fleetLeaseNamespace, name))
 		c.create(&mclv1alpha1.MultiClusterLease{ObjectMeta: metav1.ObjectMeta{Namespace: fleetLeaseNamespace, Name: fleetLeaseName}})
 		c.create(newManagerStatefulSet(fleetLeaseNamespace, managerComponent, ""))
+		c.create(newMCLDeployment(fleet.leaseBucket))
 	}
 	fleet.settle()
 	return fleet
 }
 
 func newEmptyHAFleet(t *testing.T) *haFleet {
-	return &haFleet{t: t, takeOverSteps: 6, podStopSteps: 3}
+	return &haFleet{
+		t:              t,
+		leaseStore:     mclstorage.NewFakeStorage(),
+		leaseBucket:    fleetLeaseBucket,
+		takeOverSteps:  6,
+		podStopSteps:   3,
+		leaseLossSteps: 5,
+	}
 }
 
 // addCluster adds a cluster whose objects are behind backend. The first cluster is the leader.
@@ -187,6 +228,7 @@ func (f *haFleet) addCluster(name string, backend client.WithWatch) *fleetCluste
 		gke:      operatorv1beta1.GKECluster{Project: "test-project", Location: "us-central1", Name: name},
 		backend:  backend,
 		stopping: map[types.NamespacedName]int{},
+		podModes: map[types.NamespacedName]*fleetPodState{},
 	}
 	// A request fails once its context is done, as a request to an API server does.
 	stepping := interceptor.NewClient(backend, interceptor.Funcs{
@@ -205,7 +247,10 @@ func (f *haFleet) addCluster(name string, backend client.WithWatch) *fleetCluste
 			return backend.List(ctx, list, opts...)
 		},
 		Patch: func(ctx context.Context, backend client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
-			f.step()
+			dryRun := isDryRunPatch(opts...)
+			if !dryRun {
+				f.step()
+			}
 			if err := ctx.Err(); err != nil {
 				return err
 			}
@@ -221,8 +266,37 @@ func (f *haFleet) addCluster(name string, backend client.WithWatch) *fleetCluste
 			if err := backend.Patch(ctx, obj, patch, opts...); err != nil {
 				return err
 			}
-			f.recordPatch(c, obj)
+			if !dryRun {
+				f.recordPatch(c, obj)
+			}
 			return nil
+		},
+		Update: func(ctx context.Context, backend client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+			dryRun := isDryRunUpdate(opts...)
+			if !dryRun {
+				f.step()
+			}
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if c.rejectUpdate != nil {
+				if err := c.rejectUpdate(obj); err != nil {
+					return err
+				}
+			}
+			return backend.Update(ctx, obj, opts...)
+		},
+		Delete: func(ctx context.Context, backend client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+			f.step()
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if c.rejectDelete != nil {
+				if err := c.rejectDelete(obj); err != nil {
+					return err
+				}
+			}
+			return backend.Delete(ctx, obj, opts...)
 		},
 	})
 	c.handle = &clusterHandle{contextName: name, client: &kubecli.Client{Client: stepping}}
@@ -231,6 +305,32 @@ func (f *haFleet) addCluster(name string, backend client.WithWatch) *fleetCluste
 		f.giveLease(c)
 	}
 	return c
+}
+
+func isDryRunPatch(opts ...client.PatchOption) bool {
+	po := &client.PatchOptions{}
+	for _, opt := range opts {
+		opt.ApplyToPatch(po)
+	}
+	for _, dr := range po.DryRun {
+		if dr == metav1.DryRunAll {
+			return true
+		}
+	}
+	return false
+}
+
+func isDryRunUpdate(opts ...client.UpdateOption) bool {
+	uo := &client.UpdateOptions{}
+	for _, opt := range opts {
+		opt.ApplyToUpdate(uo)
+	}
+	for _, dr := range uo.DryRun {
+		if dr == metav1.DryRunAll {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *fleetCluster) failRead(ctx context.Context, obj runtime.Object) error {
@@ -244,15 +344,25 @@ func (c *fleetCluster) failRead(ctx context.Context, obj runtime.Object) error {
 }
 
 func (f *haFleet) recordPatch(c *fleetCluster, obj client.Object) {
+	holder := ""
+	if f.holder != nil {
+		holder = f.holder.name
+	}
+	annotation := obj.GetAnnotations()[failoverReplicasAnnotation]
+	if annotation == "" {
+		annotation = obj.GetAnnotations()[deactivatedReplicasAnnotation]
+	}
 	p := fleetPatch{
 		cluster:    c.name,
 		object:     obj.GetNamespace() + "/" + obj.GetName(),
-		annotation: obj.GetAnnotations()[failoverReplicasAnnotation],
-		holder:     f.holder.name,
+		annotation: annotation,
+		holder:     holder,
 		running:    strings.Join(f.runningClusters(), ","),
 	}
-	if sts, ok := obj.(*appsv1.StatefulSet); ok {
+	if sts, ok := obj.(*appsv1.StatefulSet); ok && sts.Spec.Replicas != nil {
 		p.replicas = *sts.Spec.Replicas
+	} else if dep, ok := obj.(*appsv1.Deployment); ok && dep.Spec.Replicas != nil {
+		p.replicas = *dep.Spec.Replicas
 	}
 	f.patches = append(f.patches, p)
 }
@@ -303,30 +413,67 @@ func (f *haFleet) step() {
 	}
 	for _, c := range f.clusters {
 		c.runPods()
+		c.runDeployments()
 	}
 	f.renewOrTakeLease()
 	for _, c := range f.clusters {
+		c.updateManagerModes()
 		c.reportLease()
 		c.maintainSyncers()
 		c.reportSync()
 	}
+	f.assertNeverTwoReconciling()
 }
 
-// renewOrTakeLease is the lease itself: the holder keeps it for as long as one of its managers
-// runs. After that it expires, and the first cluster that asks for it takes it: one with a
-// running manager, or one whose MCL controller still asks for it.
+func (f *haFleet) clusterByIdentity(identity string) *fleetCluster {
+	for _, c := range f.clusters {
+		if c.identity() == identity {
+			return c
+		}
+	}
+	return nil
+}
+
+// renewOrTakeLease is the lease itself, backed by f.leaseStore: the holder keeps it for as long as
+// its MCL controller runs and one of its leader-election managers runs. After that it expires
+// (unless its renewTime is in the future, as when closed), and the first cluster that asks for it
+// takes it.
 func (f *haFleet) renewOrTakeLease() {
-	if f.holder.running() {
+	ctx := context.Background()
+	obj, err := f.leaseStore.ReadLease(ctx, fleetLeaseKey)
+	if err != nil {
+		if f.leaseStore.IsNotFound(err) {
+			f.holder = nil
+			return
+		}
+		f.t.Fatalf("reading fleet lease from store: %v", err)
+	}
+
+	holder := f.clusterByIdentity(obj.Data.HolderIdentity)
+	f.holder = holder
+
+	if holder != nil && holder.mclRunning() && holder.runningInLeaderElectionMode() {
 		f.renewals++
+		f.leaderless = 0
+		obj.Data.RenewTime = f.renewTimeVal()
+		if _, err := f.leaseStore.UpdateLease(ctx, fleetLeaseKey, obj); err != nil {
+			f.t.Fatalf("renewing fleet lease in store: %v", err)
+		}
+		return
+	}
+
+	// A closed lease (renewTime 9999-12-31T00:00:00Z) never expires.
+	if obj.Data.RenewTime.After(f.renewTimeVal()) {
 		f.leaderless = 0
 		return
 	}
+
 	f.leaderless++
 	if f.leaderless < f.takeOverSteps {
 		return
 	}
 	for _, c := range f.clusters {
-		if c.cannotLead || !(c.running() || c.stillAsks) {
+		if c.cannotLead || !c.mclRunning() || !(c.runningInLeaderElectionMode() || c.stillAsks) {
 			continue
 		}
 		c.stillAsks = false
@@ -335,16 +482,81 @@ func (f *haFleet) renewOrTakeLease() {
 	}
 }
 
-// giveLease makes the cluster the holder of the lease.
+// giveLease makes the cluster the holder of the lease in f.leaseStore.
 func (f *haFleet) giveLease(c *fleetCluster) {
+	ctx := context.Background()
 	f.holder = c
 	f.holders = append(f.holders, c.name)
 	f.renewals++
 	f.leaderless = 0
+
+	// A new leader only takes over after the prior leader's RenewDeadline has passed.
+	for _, other := range f.clusters {
+		if other == c {
+			continue
+		}
+		for _, state := range other.podModes {
+			if !state.standalone {
+				state.leading = false
+				state.reconciling = false
+			}
+		}
+	}
+
+	now := f.renewTimeVal()
+	obj, err := f.leaseStore.ReadLease(ctx, fleetLeaseKey)
+	switch {
+	case err == nil:
+		if obj.Data.HolderIdentity != c.identity() && obj.Data.HolderIdentity != "" {
+			obj.Data.LeaseTransitions++
+		}
+		obj.Data.HolderIdentity = c.identity()
+		obj.Data.RenewTime = now
+		if _, err := f.leaseStore.UpdateLease(ctx, fleetLeaseKey, obj); err != nil {
+			f.t.Fatalf("updating fleet lease in store for %q: %v", c.name, err)
+		}
+	case f.leaseStore.IsNotFound(err):
+		data := mclstorage.LeaseData{
+			HolderIdentity:   c.identity(),
+			RenewTime:        now,
+			LeaseTransitions: 1,
+		}
+		if _, err := f.leaseStore.CreateLease(ctx, fleetLeaseKey, data); err != nil {
+			f.t.Fatalf("creating fleet lease in store for %q: %v", c.name, err)
+		}
+	default:
+		f.t.Fatalf("reading fleet lease from store for %q: %v", c.name, err)
+	}
+}
+
+func (f *haFleet) renewTimeVal() time.Time {
+	return time.Date(2026, time.November, 18, 12, 0, 0, 0, time.UTC).Add(time.Duration(f.renewals) * time.Second)
 }
 
 func (f *haFleet) renewTime() string {
-	return time.Date(2026, time.November, 18, 12, 0, 0, 0, time.UTC).Add(time.Duration(f.renewals) * time.Second).Format(time.RFC3339)
+	return f.renewTimeVal().Format(time.RFC3339)
+}
+
+func (f *haFleet) nextPodUID(cluster, stsName string) types.UID {
+	f.nextUID++
+	return types.UID(fmt.Sprintf("%s-%s-uid-%d", cluster, stsName, f.nextUID))
+}
+
+func (f *haFleet) reconcilingClusters() []string {
+	var names []string
+	for _, c := range f.clusters {
+		if c.isReconciling() {
+			names = append(names, c.name)
+		}
+	}
+	return names
+}
+
+func (f *haFleet) assertNeverTwoReconciling() {
+	f.t.Helper()
+	if reconciling := f.reconcilingClusters(); len(reconciling) > 1 {
+		f.t.Fatalf("invariant violated at step %d: managers of multiple clusters reconcile at the same time: %v", f.steps, reconciling)
+	}
 }
 
 func (c *fleetCluster) create(obj client.Object) {
@@ -376,13 +588,22 @@ func managerPodKey(sts *appsv1.StatefulSet) types.NamespacedName {
 	return types.NamespacedName{Namespace: sts.Namespace, Name: sts.Name + "-0"}
 }
 
-func (c *fleetCluster) hasPod(sts *appsv1.StatefulSet) bool {
+func (c *fleetCluster) getPod(sts *appsv1.StatefulSet) (*corev1.Pod, bool) {
 	c.fleet.t.Helper()
-	err := c.backend.Get(context.Background(), managerPodKey(sts), &corev1.Pod{})
+	pod := &corev1.Pod{}
+	err := c.backend.Get(context.Background(), managerPodKey(sts), pod)
 	if err != nil && !apierrors.IsNotFound(err) {
 		c.fleet.t.Fatalf("cluster %q: getting pod %s: %v", c.name, managerPodKey(sts), err)
 	}
-	return err == nil
+	if err != nil {
+		return nil, false
+	}
+	return pod, true
+}
+
+func (c *fleetCluster) hasPod(sts *appsv1.StatefulSet) bool {
+	_, ok := c.getPod(sts)
+	return ok
 }
 
 // running reports whether a manager of the cluster runs. A manager that was scaled to 0 runs
@@ -396,36 +617,163 @@ func (c *fleetCluster) running() bool {
 	return false
 }
 
+// runningInLeaderElectionMode reports whether a manager pod of the cluster is currently running
+// with leader election enabled (not standalone).
+func (c *fleetCluster) runningInLeaderElectionMode() bool {
+	for _, sts := range c.managers() {
+		if !c.hasPod(&sts) {
+			continue
+		}
+		key := client.ObjectKeyFromObject(&sts)
+		state := c.podModes[key]
+		if state == nil || !state.standalone {
+			return true
+		}
+	}
+	return false
+}
+
+// isReconciling reports whether at least one manager pod of the cluster is actively reconciling
+// (either leading via the lease or running standalone).
+func (c *fleetCluster) isReconciling() bool {
+	for _, sts := range c.managers() {
+		if !c.hasPod(&sts) {
+			continue
+		}
+		if state := c.podModes[client.ObjectKeyFromObject(&sts)]; state != nil && state.reconciling {
+			return true
+		}
+	}
+	return false
+}
+
+// isStandaloneReconciling reports whether every manager StatefulSet of the cluster has a running
+// pod that is reconciling in standalone mode.
+func (c *fleetCluster) isStandaloneReconciling() bool {
+	managers := c.managers()
+	if len(managers) == 0 {
+		return false
+	}
+	for _, sts := range managers {
+		if !c.hasPod(&sts) {
+			return false
+		}
+		state := c.podModes[client.ObjectKeyFromObject(&sts)]
+		if state == nil || !state.standalone || !state.reconciling {
+			return false
+		}
+	}
+	return true
+}
+
+// mclRunning reports whether the cluster's MultiClusterLease controller Deployment has a running
+// pod. If no MCL Deployment exists on the cluster, it defaults to true for tests that omit it.
+func (c *fleetCluster) mclRunning() bool {
+	c.fleet.t.Helper()
+	dep := &appsv1.Deployment{}
+	err := c.backend.Get(context.Background(), types.NamespacedName{Namespace: manifestSystemNamespace, Name: mclDeploymentName}, dep)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return true
+		}
+		c.fleet.t.Fatalf("cluster %q: getting MCL Deployment: %v", c.name, err)
+	}
+	if deploymentReplicas(dep) > 0 {
+		return true
+	}
+	return dep.Status.Replicas > 0
+}
+
+func (c *fleetCluster) configConnectorHasMCL() bool {
+	c.fleet.t.Helper()
+	cc := &operatorv1beta1.ConfigConnector{}
+	if err := c.backend.Get(context.Background(), types.NamespacedName{Name: configConnectorResourceName}, cc); err != nil {
+		if apierrors.IsNotFound(err) {
+			return true
+		}
+		c.fleet.t.Fatalf("cluster %q: getting ConfigConnector: %v", c.name, err)
+	}
+	return multiClusterLeaseSpec(cc) != nil
+}
+
 // runPods is the StatefulSet controller and the kubelet: it starts and stops the pod of each
-// manager, and reports it in the status of the StatefulSet.
+// manager, reads ConfigConnector on pod startup to pick standalone vs leader-election mode, and
+// reports pod and StatefulSet status.
 func (c *fleetCluster) runPods() {
 	t := c.fleet.t
 	t.Helper()
 	ctx := context.Background()
-	for _, sts := range c.managers() {
+	managers := c.managers()
+	activeKeys := make(map[types.NamespacedName]bool, len(managers))
+	for _, sts := range managers {
 		key := client.ObjectKeyFromObject(&sts)
-		running := c.hasPod(&sts)
+		activeKeys[key] = true
+		pod, running := c.getPod(&sts)
 
 		if *sts.Spec.Replicas == 0 {
 			if running && !c.stuckPods {
 				c.stopping[key]++
 				if c.stopping[key] >= c.fleet.podStopSteps {
-					pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: sts.Namespace, Name: managerPodKey(&sts).Name}}
-					if err := c.backend.Delete(ctx, pod, client.GracePeriodSeconds(0)); err != nil {
+					delPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: sts.Namespace, Name: managerPodKey(&sts).Name}}
+					if err := c.backend.Delete(ctx, delPod, client.GracePeriodSeconds(0)); err != nil && !apierrors.IsNotFound(err) {
 						t.Fatalf("cluster %q: deleting pod %s: %v", c.name, managerPodKey(&sts), err)
 					}
+					delete(c.podModes, key)
 					running = false
+					pod = nil
 				}
+			}
+			if !running {
+				delete(c.podModes, key)
 			}
 		} else {
 			delete(c.stopping, key)
-			if !running && !c.noPods {
-				c.create(&corev1.Pod{
-					ObjectMeta: metav1.ObjectMeta{Namespace: sts.Namespace, Name: managerPodKey(&sts).Name, Labels: sts.Spec.Template.Labels},
-					Spec:       sts.Spec.Template.Spec,
-				})
-				running = true
+			if !running {
+				delete(c.podModes, key)
+				if !c.noPods {
+					newPod := &corev1.Pod{
+						ObjectMeta: metav1.ObjectMeta{
+							Namespace: sts.Namespace,
+							Name:      managerPodKey(&sts).Name,
+							Labels:    sts.Spec.Template.Labels,
+						},
+						Spec: sts.Spec.Template.Spec,
+					}
+					c.create(newPod)
+					if newPod.UID == "" {
+						newPod.UID = c.fleet.nextPodUID(c.name, sts.Name)
+						if err := c.backend.Update(ctx, newPod); err != nil {
+							t.Fatalf("cluster %q: setting UID on pod %s: %v", c.name, managerPodKey(&sts), err)
+						}
+					}
+					standalone := !c.configConnectorHasMCL()
+					leading := !standalone && c.fleet.holder == c && c.mclRunning()
+					c.podModes[key] = &fleetPodState{
+						uid:         newPod.UID,
+						standalone:  standalone,
+						leading:     leading,
+						reconciling: standalone || leading,
+					}
+					pod = newPod
+					running = true
+				}
+			} else if _, tracked := c.podModes[key]; !tracked {
+				standalone := !c.configConnectorHasMCL()
+				leading := !standalone && c.fleet.holder == c && c.mclRunning()
+				c.podModes[key] = &fleetPodState{
+					uid:          pod.UID,
+					standalone:   standalone,
+					leading:      leading,
+					reconciling:  standalone || leading,
+					restartCount: managerContainerRestartCount(pod),
+				}
 			}
+		}
+
+		if running && pod != nil {
+			state := c.podModes[key]
+			ready := !c.unreadyPods && *sts.Spec.Replicas > 0
+			c.syncPodStatus(pod, ready, state.restartCount)
 		}
 
 		status := appsv1.StatefulSetStatus{ObservedGeneration: sts.Generation}
@@ -438,20 +786,155 @@ func (c *fleetCluster) runPods() {
 		}
 		if !reflect.DeepEqual(sts.Status, status) {
 			sts.Status = status
-			if err := c.backend.Status().Update(ctx, &sts); err != nil {
+			if err := c.backend.Status().Update(ctx, &sts); err != nil && !apierrors.IsConflict(err) {
 				t.Fatalf("cluster %q: updating the status of StatefulSet %s: %v", c.name, key, err)
 			}
+		}
+	}
+	for key := range c.podModes {
+		if !activeKeys[key] {
+			delete(c.podModes, key)
+		}
+	}
+}
+
+func (c *fleetCluster) syncPodStatus(pod *corev1.Pod, ready bool, restartCount int32) {
+	t := c.fleet.t
+	t.Helper()
+	readyStatus := corev1.ConditionFalse
+	if ready {
+		readyStatus = corev1.ConditionTrue
+	}
+	startedAt := metav1.NewTime(time.Date(2026, time.November, 18, 11, 50, 0, 0, time.UTC))
+	wantCond := corev1.PodCondition{Type: corev1.PodReady, Status: readyStatus}
+	wantCS := corev1.ContainerStatus{
+		Name:         "manager",
+		Ready:        ready,
+		RestartCount: restartCount,
+		State: corev1.ContainerState{
+			Running: &corev1.ContainerStateRunning{StartedAt: startedAt},
+		},
+	}
+	needsUpdate := len(pod.Status.Conditions) != 1 || pod.Status.Conditions[0].Type != wantCond.Type || pod.Status.Conditions[0].Status != wantCond.Status ||
+		len(pod.Status.ContainerStatuses) != 1 || pod.Status.ContainerStatuses[0].Name != wantCS.Name ||
+		pod.Status.ContainerStatuses[0].Ready != wantCS.Ready || pod.Status.ContainerStatuses[0].RestartCount != wantCS.RestartCount
+	if !needsUpdate {
+		return
+	}
+	pod.Status.Conditions = []corev1.PodCondition{wantCond}
+	pod.Status.ContainerStatuses = []corev1.ContainerStatus{wantCS}
+	if err := c.backend.Status().Update(context.Background(), pod); err != nil && !apierrors.IsConflict(err) && !apierrors.IsNotFound(err) {
+		t.Fatalf("cluster %q: updating pod status %s/%s: %v", c.name, pod.Namespace, pod.Name, err)
+	}
+}
+
+// runDeployments updates the status of Deployment cnrm-system/multiclusterlease-controller-manager.
+func (c *fleetCluster) runDeployments() {
+	t := c.fleet.t
+	t.Helper()
+	ctx := context.Background()
+	dep := &appsv1.Deployment{}
+	key := types.NamespacedName{Namespace: manifestSystemNamespace, Name: mclDeploymentName}
+	if err := c.backend.Get(ctx, key, dep); err != nil {
+		if apierrors.IsNotFound(err) {
+			return
+		}
+		t.Fatalf("cluster %q: getting Deployment %s: %v", c.name, key, err)
+	}
+	replicas := deploymentReplicas(dep)
+	var status appsv1.DeploymentStatus
+	if replicas == 0 {
+		if dep.Status.Replicas > 0 {
+			c.mclStopping++
+			if c.mclStopping < c.fleet.podStopSteps {
+				return
+			}
+		}
+		status = appsv1.DeploymentStatus{ObservedGeneration: dep.Generation}
+	} else {
+		c.mclStopping = 0
+		status = appsv1.DeploymentStatus{
+			ObservedGeneration: dep.Generation,
+			Replicas:           replicas,
+			UpdatedReplicas:    replicas,
+			ReadyReplicas:      replicas,
+			AvailableReplicas:  replicas,
+		}
+	}
+	if !reflect.DeepEqual(dep.Status, status) {
+		dep.Status = status
+		if err := c.backend.Status().Update(ctx, dep); err != nil && !apierrors.IsConflict(err) {
+			t.Fatalf("cluster %q: updating status of Deployment %s: %v", c.name, key, err)
+		}
+	}
+}
+
+// updateManagerModes updates each running manager pod's leadership / standalone state based on
+// the lease in f.leaseStore. A leading manager that loses the lease exits and restarts its
+// container, re-reading ConfigConnector on restart.
+func (c *fleetCluster) updateManagerModes() {
+	t := c.fleet.t
+	t.Helper()
+	ctx := context.Background()
+	leaseObj, err := c.fleet.leaseStore.ReadLease(ctx, fleetLeaseKey)
+	if err != nil && !c.fleet.leaseStore.IsNotFound(err) {
+		t.Fatalf("reading fleet lease from store: %v", err)
+	}
+
+	holdsLease := leaseObj != nil && leaseObj.Data.HolderIdentity == c.identity() && c.mclRunning()
+	for _, sts := range c.managers() {
+		key := client.ObjectKeyFromObject(&sts)
+		pod, running := c.getPod(&sts)
+		if !running {
+			delete(c.podModes, key)
+			continue
+		}
+		state := c.podModes[key]
+		if state == nil {
+			continue
+		}
+		if state.standalone {
+			state.leading = false
+			state.reconciling = !c.unreadyPods && *sts.Spec.Replicas > 0
+			continue
+		}
+		if state.leading && !holdsLease {
+			if !c.stuckLeader {
+				state.lostLeaseSteps++
+				if state.lostLeaseSteps >= c.fleet.leaseLossSteps {
+					// Container exits on losing the lease and restarts, re-reading ConfigConnector.
+					state.restartCount++
+					state.lostLeaseSteps = 0
+					state.standalone = !c.configConnectorHasMCL()
+					state.leading = false
+					state.reconciling = state.standalone && !c.unreadyPods && *sts.Spec.Replicas > 0
+					c.syncPodStatus(pod, !c.unreadyPods && *sts.Spec.Replicas > 0, state.restartCount)
+				}
+			}
+		} else if !state.leading && holdsLease {
+			state.leading = true
+			state.reconciling = true
+			state.lostLeaseSteps = 0
+		} else if state.leading && holdsLease {
+			state.lostLeaseSteps = 0
 		}
 	}
 }
 
 // reportLease is the cluster's MCL controller: it writes the holder of the lease and its last
-// renewal to the status of the cluster's MultiClusterLease.
+// renewal from f.leaseStore to the status of the cluster's MultiClusterLease.
 func (c *fleetCluster) reportLease() {
-	if c.staleLease {
+	if c.staleLease || !c.mclRunning() {
 		return
 	}
-	c.setLeaseStatus(c.fleet.holder.identity(), c.fleet.renewTime())
+	obj, err := c.fleet.leaseStore.ReadLease(context.Background(), fleetLeaseKey)
+	if err != nil {
+		if c.fleet.leaseStore.IsNotFound(err) {
+			return
+		}
+		c.fleet.t.Fatalf("reading fleet lease from store: %v", err)
+	}
+	c.setLeaseStatus(obj.Data.HolderIdentity, obj.Data.RenewTime.UTC().Format(time.RFC3339))
 }
 
 func (c *fleetCluster) setLeaseStatus(holder, renewTime string) {
@@ -492,8 +975,9 @@ func syncerNameOf(sts *appsv1.StatefulSet) string {
 	return fleetLeaseName
 }
 
-// maintainSyncers is the cluster's Config Connector managers: each running manager keeps its
-// KRMSyncer naming the leader, suspended on the leader itself and pulling everywhere else.
+// maintainSyncers is the cluster's Config Connector managers: each running leader-election manager
+// keeps its KRMSyncer naming the leader, suspended on the leader itself and pulling everywhere else.
+// Standalone managers do not manage KRMSyncers.
 func (c *fleetCluster) maintainSyncers() {
 	t := c.fleet.t
 	t.Helper()
@@ -502,8 +986,22 @@ func (c *fleetCluster) maintainSyncers() {
 	}
 	ctx := context.Background()
 	leader := c.fleet.holder
+	if leader == nil {
+		// If the cluster's MultiClusterLease still names a cluster from before the lease closed,
+		// a running leader-election standby manager continues keeping its syncer pointed there.
+		lease := &mclv1alpha1.MultiClusterLease{}
+		if err := c.backend.Get(ctx, types.NamespacedName{Namespace: fleetLeaseNamespace, Name: fleetLeaseName}, lease); err == nil && lease.Status.GlobalHolderIdentity != nil {
+			leader = c.fleet.clusterByIdentity(*lease.Status.GlobalHolderIdentity)
+		}
+	}
+	if leader == nil {
+		return
+	}
 	for _, sts := range c.managers() {
 		if !c.hasPod(&sts) {
+			continue
+		}
+		if state := c.podModes[client.ObjectKeyFromObject(&sts)]; state != nil && state.standalone {
 			continue
 		}
 		name := syncerNameOf(&sts)
@@ -609,6 +1107,35 @@ func (c *fleetCluster) syncers() []syncerv1alpha1.KRMSyncer {
 		c.fleet.t.Fatalf("cluster %q: listing the KRMSyncers: %v", c.name, err)
 	}
 	return list.Items
+}
+
+// newMCLDeployment returns a MultiClusterLease controller Deployment configured with --gcs-bucket.
+func newMCLDeployment(bucket string) *appsv1.Deployment {
+	replicas := int32(1)
+	labels := map[string]string{"app": "mcl-controller"}
+	return &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: manifestSystemNamespace,
+			Name:      mclDeploymentName,
+			Labels:    labels,
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &replicas,
+			Selector: &metav1.LabelSelector{MatchLabels: labels},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: labels},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{
+							Name:  "manager",
+							Image: "gcr.io/gke-release/cnrm/multiclusterlease:1.162.0",
+							Args:  []string{"--gcs-bucket=" + bucket},
+						},
+					},
+				},
+			},
+		},
+	}
 }
 
 // newManagerStatefulSet returns a StatefulSet of Config Connector's manager with the labels that

@@ -146,6 +146,10 @@ func newFailoverCmd(opts failoverOptions) *cobra.Command {
 // prints immediate feedback, absorbs bounced signals during bounceWindow, and then restores
 // default OS termination so a deliberate second Ctrl-C exits immediately.
 func notifyFailoverSignals(parent context.Context, errOut io.Writer, bounceWindow time.Duration) (context.Context, context.CancelFunc) {
+	return notifyInterruptSignals(parent, errOut, bounceWindow, "\nInterrupted; starting any stopped managers again before exiting (press Ctrl-C again to exit at once).")
+}
+
+func notifyInterruptSignals(parent context.Context, errOut io.Writer, bounceWindow time.Duration, message string) (context.Context, context.CancelFunc) {
 	sigs := []os.Signal{os.Interrupt, syscall.SIGTERM}
 	if !signal.Ignored(syscall.SIGHUP) {
 		sigs = append(sigs, syscall.SIGHUP)
@@ -175,8 +179,8 @@ func notifyFailoverSignals(parent context.Context, errOut io.Writer, bounceWindo
 			signal.Stop(sigCh)
 			return
 		case <-sigCh:
-			if errOut != nil {
-				fmt.Fprintln(errOut, "\nInterrupted; starting any stopped managers again before exiting (press Ctrl-C again to exit at once).")
+			if errOut != nil && message != "" {
+				fmt.Fprintln(errOut, message)
 			}
 			cancel()
 		}

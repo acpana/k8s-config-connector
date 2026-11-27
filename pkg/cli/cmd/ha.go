@@ -30,6 +30,9 @@ const (
 
 	# Trigger a manual failover to cluster-b
 	config-connector ha failover --contexts=cluster-a,cluster-b --target-cluster=cluster-b
+
+	# Deactivate multi-cluster HA so cluster-a reconciles on its own
+	config-connector ha deactivate --contexts=cluster-a,cluster-b --standalone-cluster=cluster-a
 	`
 )
 
@@ -45,6 +48,7 @@ func NewHACmd() *cobra.Command {
 	cmd.AddCommand(ha.NewSetupCmd())
 	cmd.AddCommand(ha.NewStatusCmd())
 	cmd.AddCommand(ha.NewFailoverCmd())
+	cmd.AddCommand(ha.NewDeactivateCmd())
 
 	return cmd
 }

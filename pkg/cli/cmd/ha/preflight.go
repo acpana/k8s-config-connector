@@ -190,6 +190,13 @@ func isResourceOrKindAbsent(err error) bool {
 	return apierrors.IsNotFound(err) || meta.IsNoMatchError(err) || runtime.IsNotRegisteredError(err)
 }
 
+// namedLeaseSpec pairs a cluster's context name with its MultiClusterLeaseSpec (whether active on
+// spec.experiments.multiClusterLease or saved in the deactivated-lease annotation).
+type namedLeaseSpec struct {
+	contextName string
+	spec        *operatorv1beta1.MultiClusterLeaseSpec
+}
+
 // validateMultiClusterLeaseConfigs checks that all clusters have consistent MultiClusterLease
 // settings (identical leaseName and namespace, and a unique gkeCluster per cluster).
 func validateMultiClusterLeaseConfigs(states []*clusterHAState) error {
@@ -197,25 +204,45 @@ func validateMultiClusterLeaseConfigs(states []*clusterHAState) error {
 		return fmt.Errorf("at least 2 clusters are required for multi-cluster HA validation, got %d", len(states))
 	}
 
+	specs := make([]namedLeaseSpec, 0, len(states))
 	var errs []error
-	leaseNames := make(map[string][]string, len(states))
-	namespaces := make(map[string][]string, len(states))
-	identities := make(map[string][]string, len(states))
-
 	for _, s := range states {
 		if s == nil {
 			errs = append(errs, fmt.Errorf("cluster HA state is nil"))
 			continue
 		}
-		mcl := multiClusterLeaseSpec(s.configConnector)
-		if err := validateClusterLeaseSpec(s.contextName, mcl); err != nil {
+		specs = append(specs, namedLeaseSpec{
+			contextName: s.contextName,
+			spec:        multiClusterLeaseSpec(s.configConnector),
+		})
+	}
+	if len(errs) > 0 {
+		return errors.Join(errs...)
+	}
+	return validateMultiClusterLeaseSpecs(specs)
+}
+
+// validateMultiClusterLeaseSpecs checks that one or more clusters have valid, consistent
+// MultiClusterLease settings (identical leaseName and namespace, and a unique gkeCluster per cluster).
+func validateMultiClusterLeaseSpecs(specs []namedLeaseSpec) error {
+	if len(specs) == 0 {
+		return fmt.Errorf("at least 1 cluster is required for multi-cluster HA validation")
+	}
+
+	var errs []error
+	leaseNames := make(map[string][]string, len(specs))
+	namespaces := make(map[string][]string, len(specs))
+	identities := make(map[string][]string, len(specs))
+
+	for _, s := range specs {
+		if err := validateClusterLeaseSpec(s.contextName, s.spec); err != nil {
 			errs = append(errs, err)
 			continue
 		}
-		leaseNames[mcl.LeaseName] = append(leaseNames[mcl.LeaseName], s.contextName)
-		namespaces[mcl.Namespace] = append(namespaces[mcl.Namespace], s.contextName)
+		leaseNames[s.spec.LeaseName] = append(leaseNames[s.spec.LeaseName], s.contextName)
+		namespaces[s.spec.Namespace] = append(namespaces[s.spec.Namespace], s.contextName)
 		// validateClusterLeaseSpec checked that the identity is valid.
-		identity, _ := mcl.CandidateIdentity()
+		identity, _ := s.spec.CandidateIdentity()
 		identities[identity] = append(identities[identity], s.contextName)
 	}
 	if len(errs) > 0 {
@@ -225,16 +252,16 @@ func validateMultiClusterLeaseConfigs(states []*clusterHAState) error {
 	if len(leaseNames) != 1 {
 		errs = append(errs, fmt.Errorf(
 			"mismatched leaseName across clusters (%s): set spec.experiments.multiClusterLease.leaseName to the same value on every cluster because the GCS lock object is leases/<namespace>/<leaseName>",
-			formatClusterLeaseValues(states, func(m *operatorv1beta1.MultiClusterLeaseSpec) string { return m.LeaseName }),
+			formatNamedLeaseValues(specs, func(m *operatorv1beta1.MultiClusterLeaseSpec) string { return m.LeaseName }),
 		))
 	}
 	if len(namespaces) != 1 {
 		errs = append(errs, fmt.Errorf(
 			"mismatched lease namespace across clusters (%s): set spec.experiments.multiClusterLease.namespace to the same value on every cluster because the GCS lock object is leases/<namespace>/<leaseName>",
-			formatClusterLeaseValues(states, func(m *operatorv1beta1.MultiClusterLeaseSpec) string { return m.Namespace }),
+			formatNamedLeaseValues(specs, func(m *operatorv1beta1.MultiClusterLeaseSpec) string { return m.Namespace }),
 		))
 	}
-	if len(identities) != len(states) {
+	if len(identities) != len(specs) {
 		errs = append(errs, fmt.Errorf(
 			"duplicate gkeCluster across clusters (%s): set spec.experiments.multiClusterLease.gkeCluster on each cluster to the GKE cluster that its Config Connector runs in",
 			formatDuplicateIdentities(identities),
@@ -242,6 +269,14 @@ func validateMultiClusterLeaseConfigs(states []*clusterHAState) error {
 	}
 
 	return errors.Join(errs...)
+}
+
+func formatNamedLeaseValues(specs []namedLeaseSpec, field func(*operatorv1beta1.MultiClusterLeaseSpec) string) string {
+	parts := make([]string, 0, len(specs))
+	for _, s := range specs {
+		parts = append(parts, fmt.Sprintf("%s=%q", s.contextName, field(s.spec)))
+	}
+	return strings.Join(parts, ", ")
 }
 
 func formatClusterLeaseValues(states []*clusterHAState, field func(*operatorv1beta1.MultiClusterLeaseSpec) string) string {
