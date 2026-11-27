@@ -52,7 +52,12 @@ type deploymentWorkload struct {
 
 // fetchClusterWorkloads reads the workloads on a cluster and their pods.
 func fetchClusterWorkloads(ctx context.Context, h *clusterHandle, cc *operatorv1beta1.ConfigConnector) (*clusterWorkloads, error) {
-	mclSpec := multiClusterLeaseSpec(cc)
+	return fetchClusterWorkloadsForLease(ctx, h, cc, multiClusterLeaseSpec(cc))
+}
+
+// fetchClusterWorkloadsForLease reads the workloads on a cluster and their pods using the given
+// lease spec (either active on cc or saved in the deactivated-lease annotation).
+func fetchClusterWorkloadsForLease(ctx context.Context, h *clusterHandle, cc *operatorv1beta1.ConfigConnector, mclSpec *operatorv1beta1.MultiClusterLeaseSpec) (*clusterWorkloads, error) {
 	cw := &clusterWorkloads{}
 
 	// Check if cluster is managed by ha setup via role marker.
@@ -259,6 +264,8 @@ func checkManager(contextName string, mw *managerWorkload, isLeader bool) (strin
 	if replicas == 0 {
 		if _, hasFailoverReplicas := m.Annotations[failoverReplicasAnnotation]; hasFailoverReplicas {
 			reasonPart = fmt.Sprintf("StatefulSet %s was stopped by ha failover; running ha failover again starts it", m.key())
+		} else if _, hasDeactivatedReplicas := m.Annotations[deactivatedReplicasAnnotation]; hasDeactivatedReplicas {
+			reasonPart = fmt.Sprintf("StatefulSet %s was stopped by ha deactivate", m.key())
 		} else {
 			reasonPart = fmt.Sprintf("StatefulSet %s is scaled to 0", m.key())
 		}

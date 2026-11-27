@@ -215,11 +215,11 @@ func describeManagers(managers []*managerStatefulSet) string {
 	return "StatefulSets " + strings.Join(keys, ", ")
 }
 
-// managerPatch is a merge patch that scales a manager and sets failoverReplicasAnnotation, or
-// removes the annotation if it is nil.
-func managerPatch(replicas int32, annotation *string) (client.Patch, error) {
+// managerPatch is a merge patch that scales a workload and sets annotationKey, or removes the
+// annotation if it is nil.
+func managerPatch(annotationKey string, replicas int32, annotation *string) (client.Patch, error) {
 	data, err := json.Marshal(map[string]any{
-		"metadata": map[string]any{"annotations": map[string]any{failoverReplicasAnnotation: annotation}},
+		"metadata": map[string]any{"annotations": map[string]any{annotationKey: annotation}},
 		"spec":     map[string]any{"replicas": replicas},
 	})
 	if err != nil {
@@ -229,16 +229,18 @@ func managerPatch(replicas int32, annotation *string) (client.Patch, error) {
 }
 
 // stopManagers scales the cluster's managers to 0. It keeps the replicas that each one had in
-// failoverReplicasAnnotation, so that startManagers can undo it: in this run, or in a later one
-// if this one is interrupted.
+// annotationKey, so that a later command can undo it: in this run, or in a later one if this one
+// is interrupted.
 //
 // The operator owns these StatefulSets, but its manifests don't set spec.replicas and it applies
 // them with a client-side apply, so it leaves the replicas and the annotation as they are.
 //
-// A manager that is already at 0 is left alone, whether failover or someone else stopped it.
+// A manager that is already at 0 is left alone, whether the command or someone else stopped it.
+// If onAlreadyStoppedWithoutAnnotation is non-nil, it is called for each manager already at 0 that
+// does not carry annotationKey.
 // waiting is true if any manager was scaled down or still has pods terminating.
-func (c *failoverCluster) stopManagers(ctx context.Context, out io.Writer) (waiting bool, err error) {
-	managers, err := c.managers(ctx)
+func (h *clusterHandle) stopManagers(ctx context.Context, annotationKey string, out io.Writer, onAlreadyStoppedWithoutAnnotation func(*managerStatefulSet)) (waiting bool, err error) {
+	managers, err := h.listManagers(ctx)
 	if err != nil {
 		return false, err
 	}
@@ -248,20 +250,29 @@ func (c *failoverCluster) stopManagers(ctx context.Context, out io.Writer) (wait
 			if m.pendingStopped() != "" {
 				waiting = true
 			}
+			if onAlreadyStoppedWithoutAnnotation != nil {
+				if _, annotated := m.Annotations[annotationKey]; !annotated {
+					onAlreadyStoppedWithoutAnnotation(m)
+				}
+			}
 			continue
 		}
 		annotation := strconv.Itoa(int(replicas))
-		patch, err := managerPatch(0, &annotation)
+		patch, err := managerPatch(annotationKey, 0, &annotation)
 		if err != nil {
 			return false, err
 		}
-		if err := c.handle.client.Patch(ctx, m.StatefulSet, patch); err != nil {
-			return false, fmt.Errorf("stopping StatefulSet %s on cluster %q: %w", m.key(), c.name(), err)
+		if err := h.client.Patch(ctx, m.StatefulSet, patch); err != nil {
+			return false, fmt.Errorf("stopping StatefulSet %s on cluster %q: %w", m.key(), h.contextName, err)
 		}
 		waiting = true
-		fmt.Fprintf(out, "cluster %q: stopped Config Connector's manager (StatefulSet %s, scaled from %d to 0)\n", c.name(), m.key(), replicas)
+		fmt.Fprintf(out, "cluster %q: stopped Config Connector's manager (StatefulSet %s, scaled from %d to 0)\n", h.contextName, m.key(), replicas)
 	}
 	return waiting, nil
+}
+
+func (c *failoverCluster) stopManagers(ctx context.Context, out io.Writer) (waiting bool, err error) {
+	return c.handle.stopManagers(ctx, failoverReplicasAnnotation, out, nil)
 }
 
 // startManagers undoes stopManagers: it scales every manager that has failoverReplicasAnnotation
@@ -288,7 +299,7 @@ func (c *failoverCluster) startManagers(ctx context.Context, out io.Writer) erro
 		if current > 0 {
 			replicas = current
 		}
-		patch, err := managerPatch(replicas, nil)
+		patch, err := managerPatch(failoverReplicasAnnotation, replicas, nil)
 		if err != nil {
 			errs = append(errs, err)
 			continue
@@ -308,20 +319,24 @@ func (c *failoverCluster) startManagers(ctx context.Context, out io.Writer) erro
 
 // pendingStop returns which of the cluster's managers still has a pod after stopManagers, or ""
 // once none has. A manager stops renewing the lease only when its pod is gone.
-func (c *failoverCluster) pendingStop(ctx context.Context) (string, error) {
-	managers, err := c.managers(ctx)
+func (h *clusterHandle) pendingStop(ctx context.Context, commandName string) (string, error) {
+	managers, err := h.listManagers(ctx)
 	if err != nil {
 		return err.Error(), nil
 	}
 	for _, m := range managers {
 		if m.replicas() > 0 {
-			return "", fmt.Errorf("StatefulSet %s runs again: something scaled it up, or created it, after failover stopped the managers", m.key())
+			return "", fmt.Errorf("StatefulSet %s runs again: something scaled it up, or created it, after %s stopped the managers", m.key(), commandName)
 		}
 		if pending := m.pendingStopped(); pending != "" {
 			return pending, nil
 		}
 	}
 	return "", nil
+}
+
+func (c *failoverCluster) pendingStop(ctx context.Context) (string, error) {
+	return c.handle.pendingStop(ctx, "failover")
 }
 
 // pendingAsStandby returns what the cluster is still waiting for to be a standby of leader: its

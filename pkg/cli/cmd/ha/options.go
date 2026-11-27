@@ -64,11 +64,18 @@ func (o *baseOptions) addFlags(flags *pflag.FlagSet) {
 // validate checks that the shared base options are valid for multi-cluster HA operations
 // and normalizes context names in place.
 func (o *baseOptions) validate() error {
+	return o.validateMinContexts(2)
+}
+
+func (o *baseOptions) validateMinContexts(min int) error {
 	for i, c := range o.contexts {
 		o.contexts[i] = strings.TrimSpace(c)
 	}
-	if len(o.contexts) < 2 {
-		return fmt.Errorf("at least 2 cluster contexts must be specified via --%s", contextsFlag)
+	if len(o.contexts) < min {
+		if min == 1 {
+			return fmt.Errorf("at least 1 cluster context must be specified via --%s", contextsFlag)
+		}
+		return fmt.Errorf("at least %d cluster contexts must be specified via --%s", min, contextsFlag)
 	}
 	return validateUniqueContextNames(o.contexts)
 }
