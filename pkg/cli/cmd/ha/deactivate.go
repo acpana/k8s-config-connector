@@ -346,7 +346,7 @@ func (d *deactivator) run(ctx context.Context) error {
 		return err
 	}
 	if closeStore != nil {
-		defer closeStore()
+		defer func() { _ = closeStore() }()
 	}
 
 	if plan.initialHolderWasX {
@@ -421,14 +421,14 @@ func (d *deactivator) run(ctx context.Context) error {
 				cancel()
 				if rollbackErr != nil {
 					return fmt.Errorf(
-						"updating ConfigConnector on cluster %q failed (%v), and restoring the lease object %s also failed (%v): the lease is closed and cluster %q still has leader election configured: no cluster reconciles. Run the command again.",
+						"updating ConfigConnector on cluster %q failed (%w), and restoring the lease object %s also failed (%w): the lease is closed and cluster %q still has leader election configured: no cluster reconciles. Run the command again.",
 						d.standalone.name(), step2Err, plan.leaseObjectURI, rollbackErr, d.standalone.name(),
 					)
 				}
 				return fmt.Errorf("making cluster %q standalone failed (the lease was restored to its previous state): %w", d.standalone.name(), step2Err)
 			}
 			return fmt.Errorf(
-				"updating ConfigConnector on cluster %q failed (%v): the lease is closed and cluster %q still has leader election configured: no cluster reconciles. Run the command again.",
+				"updating ConfigConnector on cluster %q failed (%w): the lease is closed and cluster %q still has leader election configured: no cluster reconciles. Run the command again.",
 				d.standalone.name(), step2Err, d.standalone.name(),
 			)
 		}
